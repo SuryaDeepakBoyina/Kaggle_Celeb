@@ -388,3 +388,311 @@ def _generate_findings(results: dict, tgt: pd.Series) -> list:
     )
 
     return findings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUPPLEMENTARY ANALYSIS FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def rmspe_risk_analysis(
+    train: pd.DataFrame,
+    target: str = "OrderVolume",
+    hub_id: str = "HubID",
+    plot_path: Path = Path("outputs/plots"),
+) -> dict:
+    """
+    Identify hubs at high risk of inflating RMSPE due to low / near-zero volumes.
+
+    RMSPE = mean( ((y_true - y_pred) / y_true)^2 )^0.5, so small y_true values
+    cause the per-row error to explode.  Hubs whose average volume is very low
+    (< 10 units) or that frequently record near-zero days (volume < 5) are
+    flagged as high-risk.
+
+    Parameters
+    ----------
+    train     : merged train DataFrame containing hub_id and target columns
+    target    : name of the target column  (default: 'OrderVolume')
+    hub_id    : name of the hub identifier column  (default: 'HubID')
+    plot_path : directory where PNG files are saved
+
+    Returns
+    -------
+    dict with keys
+        high_risk_hubs       : list of HubIDs whose avg volume < 10
+        low_vol_hub_count    : number of such hubs (int)
+        zero_vol_days_per_hub: pd.Series  – days with volume < 5, indexed by HubID
+    """
+    plot_path = Path(plot_path)
+    plot_path.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "="*60)
+    print("RMSPE RISK ANALYSIS")
+    print("="*60)
+
+    train = train.copy()
+
+    # ── per-hub average volume ────────────────────────────────────────────
+    hub_avg = train.groupby(hub_id)[target].mean().sort_values()
+
+    # High-risk: avg volume below threshold
+    RISK_THRESHOLD = 10
+    high_risk = hub_avg[hub_avg < RISK_THRESHOLD]
+    high_risk_hubs   = high_risk.index.tolist()
+    low_vol_hub_count = len(high_risk_hubs)
+
+    print(f"  Hubs with avg {target} < {RISK_THRESHOLD}: {low_vol_hub_count}")
+    if low_vol_hub_count:
+        print(f"  Avg volume range in high-risk group: "
+              f"{high_risk.min():.2f} – {high_risk.max():.2f}")
+
+    # ── near-zero day counts per hub ─────────────────────────────────────
+    NEAR_ZERO = 5
+    near_zero_mask = train[target] < NEAR_ZERO
+    zero_vol_days_per_hub = (
+        train[near_zero_mask]
+        .groupby(hub_id)
+        .size()
+        .rename(f"days_{target}_lt_{NEAR_ZERO}")
+        .sort_values(ascending=False)
+    )
+    print(f"  Hubs with at least one day where {target} < {NEAR_ZERO}: "
+          f"{len(zero_vol_days_per_hub)}")
+    print(f"  Max near-zero days for a single hub: "
+          f"{zero_vol_days_per_hub.max() if len(zero_vol_days_per_hub) else 0}")
+
+    # ── bar plot – bottom-20 lowest avg-volume hubs ───────────────────────
+    bottom20 = hub_avg.head(20)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bottom20.plot(kind="bar", ax=ax, color=PALETTE[7], edgecolor="white", linewidth=0.4)
+    ax.axhline(y=RISK_THRESHOLD, color="red", linestyle="--", linewidth=1.2,
+               label=f"Risk threshold ({RISK_THRESHOLD})")
+    ax.set_title("Bottom-20 Hubs by Avg OrderVolume (RMSPE Risk)")
+    ax.set_xlabel(hub_id)
+    ax.set_ylabel(f"Avg {target}")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend()
+    plt.tight_layout()
+    _save(fig, plot_path / "15_rmspe_risk_hubs.png")
+
+    print(f"  High-risk hub IDs: {high_risk_hubs[:10]}"
+          f"{'  …' if len(high_risk_hubs) > 10 else ''}")
+
+    return {
+        "high_risk_hubs":        high_risk_hubs,
+        "low_vol_hub_count":     low_vol_hub_count,
+        "zero_vol_days_per_hub": zero_vol_days_per_hub,
+    }
+
+
+def data_quality_report(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    hub_id: str = "HubID",
+    date_col: str = "Date",
+    plot_path: Path = Path("outputs/plots"),
+) -> dict:
+    """
+    Produce a comprehensive data-quality report for the train and test sets.
+
+    Checks performed
+    ----------------
+    * Missing-value percentage per column (train & test)
+    * Duplicate row counts
+    * Per-hub date coverage: min date, max date, number of distinct days
+    * Train / test date overlap (should be zero – WARNING printed if any)
+
+    A heatmap of missing-value percentages is saved as
+    ``16_missing_values_heatmap.png``.
+
+    Parameters
+    ----------
+    train     : merged train DataFrame
+    test      : merged test  DataFrame
+    hub_id    : name of the hub identifier column  (default: 'HubID')
+    date_col  : name of the date column            (default: 'Date')
+    plot_path : directory where PNG files are saved
+
+    Returns
+    -------
+    dict with keys
+        train_missing_pct : pd.Series – missing % per column in train
+        test_missing_pct  : pd.Series – missing % per column in test
+        train_duplicates  : int  – duplicate row count in train
+        test_duplicates   : int  – duplicate row count in test
+        date_overlap      : set  – dates that appear in both train and test
+    """
+    plot_path = Path(plot_path)
+    plot_path.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "="*60)
+    print("DATA QUALITY REPORT")
+    print("="*60)
+
+    train = train.copy()
+    test  = test.copy()
+    train[date_col] = pd.to_datetime(train[date_col])
+    test[date_col]  = pd.to_datetime(test[date_col])
+
+    # ── missing values ────────────────────────────────────────────────────
+    train_missing_pct = (train.isnull().mean() * 100).round(2)
+    test_missing_pct  = (test.isnull().mean()  * 100).round(2)
+
+    print("\n  Train – missing % per column:")
+    print(train_missing_pct[train_missing_pct > 0].to_string()
+          if train_missing_pct.any() else "    None")
+    print("\n  Test – missing % per column:")
+    print(test_missing_pct[test_missing_pct > 0].to_string()
+          if test_missing_pct.any() else "    None")
+
+    # ── duplicates ────────────────────────────────────────────────────────
+    train_duplicates = int(train.duplicated().sum())
+    test_duplicates  = int(test.duplicated().sum())
+    print(f"\n  Duplicate rows – train: {train_duplicates:,}  |  test: {test_duplicates:,}")
+
+    # ── per-hub date coverage ─────────────────────────────────────────────
+    hub_coverage = (
+        train.groupby(hub_id)[date_col]
+        .agg(min_date="min", max_date="max", day_count="nunique")
+    )
+    print("\n  Per-hub date coverage (train) – first 5 hubs:")
+    print(hub_coverage.head().to_string())
+    print(f"  Day-count stats: min={hub_coverage['day_count'].min()} "
+          f"max={hub_coverage['day_count'].max()} "
+          f"mean={hub_coverage['day_count'].mean():.1f}")
+
+    # ── train / test date overlap ─────────────────────────────────────────
+    train_dates = set(train[date_col].dt.normalize().unique())
+    test_dates  = set(test[date_col].dt.normalize().unique())
+    date_overlap = train_dates & test_dates
+
+    if date_overlap:
+        print(f"\n  ⚠️  WARNING: {len(date_overlap)} date(s) appear in BOTH "
+              f"train and test – potential data leakage!")
+        print(f"  Overlapping dates (first 5): "
+              f"{sorted(date_overlap)[:5]}")
+    else:
+        print("\n  ✅ No date overlap between train and test.")
+
+    # ── heatmap of missing % (combined view) ─────────────────────────────
+    # Align columns for a side-by-side heatmap
+    all_cols = sorted(set(train.columns) | set(test.columns))
+    miss_df  = pd.DataFrame({
+        "train": train_missing_pct.reindex(all_cols, fill_value=0),
+        "test":  test_missing_pct.reindex(all_cols,  fill_value=0),
+    }).T  # shape: (2, n_cols)
+
+    fig, ax = plt.subplots(figsize=(max(10, len(all_cols) * 0.6), 3))
+    sns.heatmap(
+        miss_df,
+        annot=True, fmt=".1f", cmap="YlOrRd",
+        vmin=0, vmax=100,
+        linewidths=0.5, ax=ax,
+        annot_kws={"size": 8},
+        cbar_kws={"label": "Missing %"},
+    )
+    ax.set_title("Missing Value % per Column  (train vs test)")
+    ax.set_xlabel("Column")
+    ax.tick_params(axis="x", rotation=45)
+    plt.tight_layout()
+    _save(fig, plot_path / "16_missing_values_heatmap.png")
+
+    return {
+        "train_missing_pct": train_missing_pct,
+        "test_missing_pct":  test_missing_pct,
+        "train_duplicates":  train_duplicates,
+        "test_duplicates":   test_duplicates,
+        "date_overlap":      date_overlap,
+    }
+
+
+def autocorrelation_plot(
+    train: pd.DataFrame,
+    hub_id: str = "HubID",
+    target: str = "OrderVolume",
+    date_col: str = "Date",
+    n_lags: int = 28,
+    plot_path: Path = Path("outputs/plots"),
+) -> pd.Series:
+    """
+    Compute and plot autocorrelation of the target time series for the hub
+    with the most observations.
+
+    Autocorrelation at lag k is the Pearson correlation between the series
+    and its k-step lagged version.  Lags 1 through ``n_lags`` are computed
+    and plotted as a bar chart with ±1.96/√N confidence bands.
+
+    The plot is saved as ``17_autocorrelation.png``.
+
+    Parameters
+    ----------
+    train     : merged train DataFrame
+    hub_id    : name of the hub identifier column  (default: 'HubID')
+    target    : name of the target column           (default: 'OrderVolume')
+    date_col  : name of the date column             (default: 'Date')
+    n_lags    : number of lags to compute           (default: 28)
+    plot_path : directory where PNG files are saved
+
+    Returns
+    -------
+    pd.Series  – autocorrelation values indexed by lag (1 … n_lags)
+    """
+    plot_path = Path(plot_path)
+    plot_path.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "="*60)
+    print("AUTOCORRELATION ANALYSIS")
+    print("="*60)
+
+    train = train.copy()
+    train[date_col] = pd.to_datetime(train[date_col])
+
+    # ── pick the hub with the most data points ────────────────────────────
+    best_hub = train.groupby(hub_id).size().idxmax()
+    hub_series = (
+        train[train[hub_id] == best_hub]
+        .sort_values(date_col)
+        .set_index(date_col)[target]
+    )
+    n_obs = len(hub_series)
+    print(f"  Selected hub: {best_hub}  ({n_obs} observations)")
+
+    # ── compute autocorrelation for lags 1 … n_lags ───────────────────────
+    acf_values = {
+        lag: hub_series.autocorr(lag=lag)
+        for lag in range(1, n_lags + 1)
+    }
+    acf_series = pd.Series(acf_values, name="autocorrelation")
+    acf_series.index.name = "lag"
+
+    print(f"  Lag-1  autocorr : {acf_series.iloc[0]:.4f}")
+    print(f"  Lag-7  autocorr : {acf_series.get(7, float('nan')):.4f}")
+    print(f"  Lag-14 autocorr : {acf_series.get(14, float('nan')):.4f}")
+    print(f"  Lag-28 autocorr : {acf_series.get(28, float('nan')):.4f}")
+
+    # ── confidence band ±1.96 / sqrt(N) ──────────────────────────────────
+    conf_band = 1.96 / np.sqrt(n_obs)
+
+    # ── plot ──────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 5))
+    lags = acf_series.index.tolist()
+    colors = [
+        PALETTE[0] if abs(v) > conf_band else PALETTE[4]
+        for v in acf_series.values
+    ]
+    ax.bar(lags, acf_series.values, color=colors, edgecolor="white", linewidth=0.4)
+    ax.axhline(y=0, color="black", linewidth=0.8)
+    ax.axhline(y=conf_band,  color="red", linestyle="--", linewidth=1,
+               label=f"±1.96/√N ({conf_band:.3f})")
+    ax.axhline(y=-conf_band, color="red", linestyle="--", linewidth=1)
+    ax.set_title(
+        f"Autocorrelation – Hub {best_hub}\n"
+        f"(bars outside red band are statistically significant)"
+    )
+    ax.set_xlabel("Lag (days)")
+    ax.set_ylabel("Autocorrelation")
+    ax.set_xticks(lags)
+    ax.legend()
+    plt.tight_layout()
+    _save(fig, plot_path / "17_autocorrelation.png")
+
+    return acf_series
