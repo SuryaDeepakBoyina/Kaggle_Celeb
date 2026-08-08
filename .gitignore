@@ -1,6 +1,5 @@
-# ── Data files (large CSVs – don't bloat the repo) ──────────────────────────
-Dataset/
-demand_forecasting_project/data/
+
+
 
 # ── Model / output artifacts ─────────────────────────────────────────────────
 demand_forecasting_project/outputs/model_artifacts/
