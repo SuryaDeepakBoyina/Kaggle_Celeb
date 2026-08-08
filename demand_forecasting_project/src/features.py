@@ -257,8 +257,8 @@ def _encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     """Label-encode object / category columns for LightGBM / XGBoost."""
     cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
 
-    # Exclude identifier / date columns
-    exclude = {"Date", "HubID"}
+    # Exclude identifier / date / helper columns
+    exclude = {"Date", "HubID", "_set"}
     cat_cols = [c for c in cat_cols if c not in exclude]
 
     for col in cat_cols:
@@ -277,7 +277,7 @@ def get_feature_cols(df: pd.DataFrame) -> list:
     Excludes identifiers, raw date, and the target.
     """
     exclude = {
-        "HubID", "Id", "Date", "OrderVolume",
+        "HubID", "Id", "Date", "OrderVolume", "_set",
         # raw metadata fields kept for reference
         "CompetitorOpenSinceMonth", "CompetitorOpenSinceYear",
         "LoyaltyProgramSinceWeek", "LoyaltyProgramSinceYear",
